@@ -1654,53 +1654,242 @@ def pagina_diagnostico_preditivo(base_filtrada):
     exibir_grafico(grafico_heatmap, use_container_width=True)
 
     st.markdown("---")
-    st.subheader("5. Simulador de redução de desconto")
-    st.write("Simulação simples para estimar o ganho de lucro caso o desconto médio seja reduzido.")
-
-    desconto_atual = base_preditiva_filtrada["desconto_pct_pred"].mean()
-
-    novo_desconto = st.slider(
-        "Novo desconto médio simulado (%)",
-        min_value=0.0,
-        max_value=float(max(25, round(desconto_atual + 5, 1))),
-        value=float(round(max(desconto_atual - 5, 0), 1)),
-        step=0.5
+    st.subheader("5. Simulador de desconto para meta de receita")
+    st.write(
+        "Simulação para estimar qual desconto seria necessário para alcançar uma meta de "
+        "crescimento de receita, considerando produto, segmento/linha e região."
     )
 
-    receita_total = base_preditiva_filtrada["receita_pred"].sum()
-    lucro_total = base_preditiva_filtrada["lucro_pred"].sum()
+    st.markdown(
+        f"""
+        <div class="regiao-card" style="min-height: auto; margin-top: 8px; margin-bottom: 22px;">
+            <h4 style="margin-top: 0; color: {COR_TEXTO};">Como funciona o simulador</h4>
+            <p><strong>Objetivo:</strong> calcular qual desconto estimado seria necessário para atingir uma meta de crescimento de receita no recorte selecionado.</p>
+            <p><strong>Metodologia:</strong> o dashboard analisa o histórico do recorte selecionado e estima a sensibilidade entre desconto e receita. Em seguida, calcula o desconto necessário para alcançar a receita-meta definida pelo usuário.</p>
+            <p><strong>Leitura:</strong> quando o histórico mostra que mais desconto está associado a mais receita, o simulador pode recomendar aumento de desconto. Quando o histórico mostra o contrário, o simulador pode indicar redução de desconto ou avisar que a meta não é viável dentro do limite simulado.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    desconto_atual_decimal = desconto_atual / 100
-    novo_desconto_decimal = novo_desconto / 100
+    base_simulador = base_preditiva_filtrada.copy()
 
-    if desconto_atual_decimal < 1:
-        receita_bruta_estimada = receita_total / (1 - desconto_atual_decimal)
+    if "linha_produto" not in base_simulador.columns:
+        base_simulador["linha_produto"] = "Não informado"
+
+    produtos_simulador = ["Todos"] + sorted(base_simulador["produto_pred"].dropna().unique())
+    linhas_simulador = ["Todos"] + sorted(base_simulador["linha_produto"].dropna().astype(str).unique())
+    regioes_simulador = ["Todas"] + sorted(base_simulador["regiao_pred"].dropna().unique())
+
+    col_sim_filtro1, col_sim_filtro2, col_sim_filtro3, col_sim_filtro4 = st.columns(4)
+
+    with col_sim_filtro1:
+        produto_simulado = st.selectbox(
+            "Produto",
+            options=produtos_simulador,
+            key="simulador_produto_meta_receita"
+        )
+
+    with col_sim_filtro2:
+        linha_simulada = st.selectbox(
+            "Segmento / linha do produto",
+            options=linhas_simulador,
+            key="simulador_linha_meta_receita"
+        )
+
+    with col_sim_filtro3:
+        regiao_simulada = st.selectbox(
+            "Região",
+            options=regioes_simulador,
+            key="simulador_regiao_meta_receita"
+        )
+
+    with col_sim_filtro4:
+        meta_aumento_receita = st.number_input(
+            "Meta de aumento da receita (%)",
+            min_value=0.1,
+            max_value=100.0,
+            value=1.0,
+            step=0.1,
+            key="simulador_meta_aumento_receita"
+        )
+
+    base_meta_simulada = base_simulador.copy()
+
+    if produto_simulado != "Todos":
+        base_meta_simulada = base_meta_simulada[base_meta_simulada["produto_pred"] == produto_simulado]
+
+    if linha_simulada != "Todos":
+        base_meta_simulada = base_meta_simulada[base_meta_simulada["linha_produto"].astype(str) == linha_simulada]
+
+    if regiao_simulada != "Todas":
+        base_meta_simulada = base_meta_simulada[base_meta_simulada["regiao_pred"] == regiao_simulada]
+
+    if base_meta_simulada.empty:
+        st.warning("Não há dados para o produto, segmento e região selecionados no simulador.")
+        st.stop()
+
+    receita_atual = base_meta_simulada["receita_pred"].sum()
+    lucro_atual = base_meta_simulada["lucro_pred"].sum()
+    desconto_atual = base_meta_simulada["desconto_pct_pred"].mean()
+    margem_atual = dividir_seguro(lucro_atual, receita_atual) * 100
+    meta_receita = receita_atual * (1 + (meta_aumento_receita / 100))
+    gap_receita = meta_receita - receita_atual
+
+    def calcular_coeficientes_simulador(dados_recorte, dados_fallback):
+        """
+        Calcula a sensibilidade histórica entre desconto e receita/margem.
+        Primeiro tenta usar o recorte selecionado. Se houver pouca variação,
+        usa a base filtrada da página como referência.
+        """
+        def ajustar_coeficientes(dados_entrada):
+            dados_modelo = dados_entrada[["desconto_pct_pred", "receita_pred", "margem_pct_pred"]].copy()
+            dados_modelo = dados_modelo.replace([np.inf, -np.inf], np.nan).dropna()
+            dados_modelo = dados_modelo[dados_modelo["receita_pred"] > 0]
+
+            if len(dados_modelo) < 3:
+                return None
+
+            if dados_modelo["desconto_pct_pred"].nunique() < 2:
+                return None
+
+            coef_receita, _ = np.polyfit(
+                dados_modelo["desconto_pct_pred"],
+                dados_modelo["receita_pred"],
+                1
+            )
+
+            if dados_modelo["margem_pct_pred"].nunique() >= 2:
+                coef_margem, _ = np.polyfit(
+                    dados_modelo["desconto_pct_pred"],
+                    dados_modelo["margem_pct_pred"],
+                    1
+                )
+            else:
+                coef_margem = 0
+
+            return coef_receita, coef_margem
+
+        resultado_recorte = ajustar_coeficientes(dados_recorte)
+
+        if resultado_recorte is not None:
+            return resultado_recorte[0], resultado_recorte[1], "Histórico do recorte selecionado"
+
+        resultado_fallback = ajustar_coeficientes(dados_fallback)
+
+        if resultado_fallback is not None:
+            return resultado_fallback[0], resultado_fallback[1], "Histórico geral da página, usado como referência por falta de variação no recorte"
+
+        return 0, 0, "Sensibilidade insuficiente para cálculo estatístico"
+
+    sensibilidade_receita, sensibilidade_margem, base_referencia_simulador = calcular_coeficientes_simulador(
+        base_meta_simulada,
+        base_simulador
+    )
+
+    limite_desconto_minimo = 0.0
+    limite_desconto_maximo = 30.0
+
+    if receita_atual <= 0:
+        st.warning("A receita atual do recorte selecionado é zero. Não é possível calcular a meta simulada.")
+        st.stop()
+
+    if abs(sensibilidade_receita) < 0.01:
+        desconto_recomendado_bruto = desconto_atual
+        desconto_recomendado = desconto_atual
+        receita_simulada = receita_atual
+        meta_atingida_simulada = False
+        mensagem_viabilidade = "Não há sensibilidade histórica suficiente entre desconto e receita para estimar um desconto recomendado."
     else:
-        receita_bruta_estimada = receita_total
+        desconto_recomendado_bruto = desconto_atual + (gap_receita / sensibilidade_receita)
+        desconto_recomendado = min(
+            max(desconto_recomendado_bruto, limite_desconto_minimo),
+            limite_desconto_maximo
+        )
+        receita_simulada = receita_atual + sensibilidade_receita * (desconto_recomendado - desconto_atual)
+        meta_atingida_simulada = receita_simulada >= meta_receita
 
-    receita_simulada = receita_bruta_estimada * (1 - novo_desconto_decimal)
-    ganho_estimado = receita_simulada - receita_total
-    lucro_simulado = lucro_total + ganho_estimado
+        if desconto_recomendado_bruto < limite_desconto_minimo:
+            mensagem_viabilidade = "A meta exigiria desconto abaixo de 0%. O simulador aplicou o limite mínimo de 0%."
+        elif desconto_recomendado_bruto > limite_desconto_maximo:
+            mensagem_viabilidade = "A meta exigiria desconto acima de 30%. O simulador aplicou o limite máximo de 30%."
+        elif meta_atingida_simulada:
+            mensagem_viabilidade = "A meta é viável dentro do intervalo de desconto simulado."
+        else:
+            mensagem_viabilidade = "A meta não foi atingida dentro do intervalo de desconto simulado."
 
-    margem_atual = dividir_seguro(lucro_total, receita_total) * 100
-    margem_simulada = dividir_seguro(lucro_simulado, receita_simulada) * 100
+    variacao_desconto = desconto_recomendado - desconto_atual
+    margem_simulada = margem_atual + sensibilidade_margem * variacao_desconto
+    lucro_simulado = receita_simulada * (margem_simulada / 100)
+    diferenca_meta = receita_simulada - meta_receita
 
-    col_sim1, col_sim2, col_sim3 = st.columns(3)
+    # =========================
+    # CARDS DO SIMULADOR
+    # =========================
 
-    with col_sim1:
-        exibir_card_kpi("Ganho estimado", formatar_moeda(ganho_estimado), "Estimativa de ganho com redução do desconto.", status="positivo" if ganho_estimado > 0 else "critico")
-    with col_sim2:
-        exibir_card_kpi("Margem atual", formatar_percentual(margem_atual), "Margem observada nos filtros selecionados.", status="critico" if margem_atual < LIMITE_MINIMO_MARGEM else "positivo")
-    with col_sim3:
-        exibir_card_kpi("Margem simulada", formatar_percentual(margem_simulada), "Margem estimada após ajuste do desconto.", status="critico" if margem_simulada < LIMITE_MINIMO_MARGEM else "positivo")
+    col_res1, col_res2, col_res3 = st.columns(3)
+
+    with col_res1:
+        exibir_card_kpi(
+            "Receita atual",
+            formatar_moeda(receita_atual),
+            "Receita observada no recorte selecionado."
+        )
+
+    with col_res2:
+        exibir_card_kpi(
+            "Meta de receita",
+            formatar_moeda(meta_receita),
+            f"Crescimento desejado de {formatar_percentual(meta_aumento_receita)}."
+        )
+
+    with col_res3:
+        exibir_card_kpi(
+            "Gap para a meta",
+            formatar_moeda(gap_receita),
+            "Valor adicional necessário para bater a meta.",
+            status="critico" if gap_receita > 0 else "positivo"
+        )
+
+    col_res4, col_res5, col_res6, col_res7 = st.columns(4)
+
+    with col_res4:
+        exibir_card_kpi(
+            "Desconto médio atual",
+            formatar_percentual(desconto_atual),
+            "Desconto médio observado no recorte."
+        )
+
+    with col_res5:
+        exibir_card_kpi(
+            "Desconto recomendado",
+            formatar_percentual(desconto_recomendado),
+            "Desconto estimado para buscar a meta.",
+            status="positivo" if meta_atingida_simulada else "critico"
+        )
+
+    with col_res6:
+        exibir_card_kpi(
+            "Variação necessária",
+            formatar_percentual(variacao_desconto),
+            "Diferença entre desconto atual e recomendado.",
+            status="critico" if variacao_desconto > 0 else "positivo"
+        )
+
+    with col_res7:
+        exibir_card_kpi(
+            "Diferença para meta",
+            formatar_moeda(diferenca_meta),
+            "Valor acima ou abaixo da meta após a simulação.",
+            status="positivo" if diferenca_meta >= 0 else "critico"
+        )
 
     st.info(
-        f"Com os filtros selecionados, o desconto médio atual é de "
-        f"{formatar_percentual(desconto_atual)}. Ao simular um desconto médio de "
-        f"{formatar_percentual(novo_desconto)}, o ganho estimado é de "
-        f"{formatar_moeda(ganho_estimado)}."
+        f"Para o recorte selecionado, a receita atual é de {formatar_moeda(receita_atual)}. "
+        f"Para crescer {formatar_percentual(meta_aumento_receita)}, a meta simulada é de {formatar_moeda(meta_receita)}. "
+        f"Com base na sensibilidade histórica entre desconto e receita, o desconto recomendado é de "
+        f"{formatar_percentual(desconto_recomendado)}. {mensagem_viabilidade}"
     )
-
 
 
 # =========================
